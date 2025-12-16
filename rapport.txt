@@ -1,0 +1,88 @@
+1. Architecture mise en place
+
+L'architecture repose sur la séparation des responsabilités (CQRS simplifié) et l'utilisation d'un cache pour soulager la base de données.
+Extrait de code
+
+graph TD
+    User[Client API] -->|HTTP| API[Node.js API]
+    API -->|Read Cache| Redis[Redis Cache]
+    API -->|Write (Port 5439)| HAProxy
+    API -->|Read Miss (Port 5433)| Replica[DB Replica]
+
+    HAProxy -->|TCP Check| Primary[DB Primary]
+    Primary -->|Streaming Replication| Replica
+
+    API (Node.js) : Orchestre la logique métier.
+
+    HAProxy : Point d'entrée unique pour les écritures, protège l'accès direct au Primary.
+
+    Redis : Stockage clé-valeur en RAM pour les lectures fréquentes.
+
+    PostgreSQL (Primary & Replica) : Cluster de données maître-esclave.
+
+2. Stratégie de Lecture / Écriture
+
+Nous avons implémenté un routing applicatif :
+
+    Écritures (INSERT, UPDATE) : Envoyées vers HAProxy (qui pointe vers le Primary). Le Primary est le seul autorisé à modifier les données.
+
+    Lectures (SELECT) : Envoyées vers le Replica. Cela permet de décharger le serveur principal qui gère déjà l'intégrité des données et la réplication.
+
+    Problématique rencontrée : Le Replication Lag. Il existe un léger délai (quelques millisecondes) entre l'écriture sur le Primary et l'apparition de la donnée sur le Replica.
+
+3. Stratégie de Cache (Redis)
+
+Nous utilisons le pattern Cache-Aside :
+
+    Lecture : L'API interroge d'abord Redis.
+
+        Hit : On renvoie la donnée immédiatement (rapide).
+
+        Miss : On interroge le DB Replica, on stocke le résultat dans Redis, puis on renvoie la donnée.
+
+    TTL (Time To Live) : Fixé à 60 secondes. C'est un compromis pour éviter d'afficher des données trop vieilles tout en gardant le bénéfice du cache.
+
+    Invalidation : Lors d'un UPDATE (PUT), nous supprimons explicitement la clé dans Redis (redis.del). Cela force la prochaine lecture à récupérer la donnée fraîche en base de données.
+
+4. Mesures et Performance
+
+    Temps de réponse sans cache (Cold Start) : ~15ms - 20ms (accès disque/réseau DB).
+
+    Temps de réponse avec cache (Hot) : < 2ms (accès RAM Redis).
+
+Conclusion : Le cache réduit drastiquement la latence pour l'utilisateur et économise les ressources du serveur PostgreSQL (CPU/IO).
+5. Retour sur la Haute Disponibilité (HA)
+
+Ce TP a mis en évidence la différence fondamentale entre Réplication et Haute Disponibilité.
+
+    Constat : Lorsque le conteneur db-primary a été arrêté, la réplication existait toujours (les données étaient sur le réplica), mais le service est tombé (écritures impossibles).
+
+    Action manuelle : Pour rétablir le service, nous avons dû :
+
+        Promouvoir le réplica (pg_ctl promote).
+
+        Modifier la configuration HAProxy.
+
+        Redémarrer HAProxy.
+
+    Conclusion : Nous avons de la redondance de données, mais pas de bascule automatique (Failover).
+
+6. Réponses aux questions finales
+
+Q1. Différence entre réplication et haute disponibilité ? La réplication assure la copie des données à plusieurs endroits (sécurité, lecture distribuée). La haute disponibilité assure que le service reste accessible sans interruption humaine, même en cas de panne (bascule automatique).
+
+Q2. Qu’est-ce qui est manuel ici ? Automatique ?
+
+    Automatique : La synchronisation des données (Streaming Replication).
+
+    Manuel : La détection de la panne, la promotion du nouveau maître et la reconfiguration du routeur (HAProxy).
+
+Q3. Risques Cache + Réplication ? Le risque principal est l'incohérence des données (Stale Data). Un utilisateur peut voir un vieux prix si le cache n'a pas expiré ou si le réplica a du retard par rapport au primaire.
+
+Q4. Comment améliorer cette architecture en production ?
+
+    Utiliser Patroni ou Repmgr pour gérer l'élection automatique du nouveau Primary.
+
+    Utiliser Redis Sentinel pour la haute disponibilité du cache.
+
+    Automatiser la mise à jour de HAProxy via des outils de Service Discovery (Consul, Etcd).
