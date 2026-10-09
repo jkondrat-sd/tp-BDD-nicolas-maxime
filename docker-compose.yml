@@ -1,6 +1,6 @@
 services:
   db-primary:
-    image: bitnami/postgresql:16
+    image: soldevelo/postgresql:16
     container_name: db-primary
     environment:
       - POSTGRESQL_USERNAME=app
@@ -15,7 +15,7 @@ services:
       - primary_data:/bitnami/postgresql
 
   db-replica:
-    image: bitnami/postgresql:16
+    image: soldevelo/postgresql:16
     container_name: db-replica
     depends_on:
       - db-primary
